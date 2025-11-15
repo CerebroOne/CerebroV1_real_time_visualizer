@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis
+    container_name: neural_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6380}:6380"
+    environment:
+      - REDIS_PORT=6380
+      - REDIS_MAXMEMORY=2048mb # Limit Redis memory usage to 1024mb
+    volumes:
+      - ./redis_data:/data
+      - ./redis_config/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf --save 60 1 --loglevel warning
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - neural_network
+    # user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+
+  receiver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    container_name: neural_receiver
+    restart: unless-stopped
+    # Run as non-root user (set via build args)
+    user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./neural_data:/app/neural_data
+      - ./real_time_visualizer_src:/app/real_time_visualizer_src
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6380
+      - REDIS_DB=0
+      - REDIS_QUEUE_NAME=neural_data_queue
+      - LISTEN_HOST=0.0.0.0
+      - LISTEN_PORT=5000
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - neural_network
+
+  # Optional: Redis consumer for monitoring
+  # consumer:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #     args:
+  #       USER_ID: ${USER_ID:-1000}
+  #       GROUP_ID: ${GROUP_ID:-1000}
+  #   container_name: neural_consumer
+  #   restart: unless-stopped
+  #   user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+  #   volumes:
+  #     - ./real_time_visualizer_src:/app/real_time_visualizer_src
+  #   environment:
+  #     - REDIS_HOST=redis
+  #     - REDIS_PORT=6379
+  #     - REDIS_DB=0
+  #     - REDIS_QUEUE_NAME=neural_data_queue
+  #   command: python real_time_visualizer_src/redis_consumer.py --blocking
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - neural_network
+  #   profiles:
+  #     - monitoring
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  neural_network:
+    driver: bridge
