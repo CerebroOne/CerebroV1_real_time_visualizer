@@ -1,13 +1,13 @@
 #!/bin/bash
 
 ###################################################################################
-# Automatic Neural Compression Calibration Script
+# Automatic Neural Compression Calibration Script v3
 ###################################################################################
 # This script automates the full calibration workflow:
-# 1. Launch TCP server on remote host (via SSH)
+# 1. Launch TCP server on remote host with timeout (via SSH)
 # 2. Start recording on neurocompressor
 # 3. Send test pulse patterns
-# 4. Stop recording
+# 4. Wait for TCP server timeout (saves data automatically)
 # 5. Download data and generate report
 ###################################################################################
 
@@ -52,30 +52,72 @@ Automated neural compression calibration with report generation.
 
 OPTIONS:
     -h, --host HOST          Remote host IP (default: $DEFAULT_HOST)
-    -u, --user USER          Remote SSH user (default: $DEFAULT_USER)
+    -u, --user USER          Remote SSH user (default: $DEFAULT_REMOTE_USER)
     -o, --output DIR         Output directory for data and report (required)
     -n, --name NAME          Recording name/identifier (required)
     -p, --pulses PATTERN     Pulse pattern for test generator (default: "10 50 50 50")
-    -d, --delay SECONDS      Delay after pulses before stopping (default: 5)
+    -s, --safety SECONDS     Extra safety time after pattern (default: 3)
     -r, --remote-only        Only launch remote server (for manual testing)
     --help                   Show this help message
 
 EXAMPLES:
-    # Basic usage with required parameters
+    # Basic usage - auto-calculates recording time
     $(basename "$0") -o ./calibration_data -n test_001 -p "10 50 50 50"
+    
+    # With extra safety margin
+    $(basename "$0") -o ./data -n test_002 -p "20 30 40 50" -s 5
 
-    # Custom host and longer recording
-    $(basename "$0") -h 192.168.8.100 -o ./data -n exp_042 -p "20 30 40 50" -d 10
-
-    # Remote server only (manual control)
-    $(basename "$0") -h 192.168.8.209 -n manual_test -r
+    # Quick pattern
+    $(basename "$0") -o ./quick -n fast_test -p "5 10 10"
 
 MQTT TOPICS:
     Control:   $MQTT_CONTROL_TOPIC (record_on/record_off)
     Generator: $MQTT_GENERATOR_TOPIC (pulse patterns)
 
+NOTE: Recording duration is calculated automatically from pulse pattern:
+      Duration = N × sum(delays) + safety_margin
+      Example: "10 50 50 50" = 10 × (50+50+50) = 1500ms = 2s + 3s safety = 5s total
+
 EOF
     exit 1
+}
+
+# ==================== Calculate Recording Duration ====================
+calculate_recording_duration() {
+    local pattern="$1"
+    local safety_margin="$2"
+    
+    # Parse pattern: "N delay1 delay2 delay3 ..."
+    local numbers=($pattern)
+    
+    if [ ${#numbers[@]} -lt 2 ]; then
+        log_error "Invalid pulse pattern: need at least N and one delay"
+        exit 1
+    fi
+    
+    local repetitions=${numbers[0]}
+    local sum_delays=0
+    
+    # Sum all delays (skip first number which is repetitions)
+    for ((i=1; i<${#numbers[@]}; i++)); do
+        sum_delays=$((sum_delays + ${numbers[$i]}))
+    done
+    
+    # Calculate total time in milliseconds
+    local total_ms=$((repetitions * sum_delays))
+    
+    # Convert to seconds (round up)
+    local total_seconds=$(( (total_ms + 999) / 1000 ))
+    
+    # Add safety margin
+    local final_duration=$((total_seconds + safety_margin))
+    
+    # Minimum 5 seconds
+    if [ $final_duration -lt 5 ]; then
+        final_duration=5
+    fi
+    
+    echo $final_duration
 }
 
 # ==================== Parse Arguments ====================
@@ -84,7 +126,7 @@ REMOTE_USER="$DEFAULT_REMOTE_USER"
 OUTPUT_DIR=""
 RECORDING_NAME=""
 PULSE_PATTERN="10 50 50 50"
-DELAY_AFTER_PULSES=5
+SAFETY_MARGIN=3
 REMOTE_ONLY=false
 
 while [[ $# -gt 0 ]]; do
@@ -109,8 +151,8 @@ while [[ $# -gt 0 ]]; do
             PULSE_PATTERN="$2"
             shift 2
             ;;
-        -d|--delay)
-            DELAY_AFTER_PULSES="$2"
+        -s|--safety)
+            SAFETY_MARGIN="$2"
             shift 2
             ;;
         -r|--remote-only)
@@ -138,6 +180,9 @@ if [ "$REMOTE_ONLY" = false ] && [ -z "$OUTPUT_DIR" ]; then
     usage
 fi
 
+# Calculate recording duration from pulse pattern
+RECORDING_DURATION=$(calculate_recording_duration "$PULSE_PATTERN" "$SAFETY_MARGIN")
+
 # ==================== Setup ====================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECORDING_FILE="${RECORDING_NAME}.json"
@@ -155,7 +200,7 @@ if [ "$REMOTE_ONLY" = false ]; then
     log_info "Local report path: $LOCAL_REPORT_PATH"
 fi
 
-# Global variable to track SSH PID
+# Global variable to track SSH PID (for remote-only mode)
 SSH_PID=""
 
 # ==================== Cleanup Function ====================
@@ -163,16 +208,10 @@ cleanup() {
     local exit_code=$?
     log_warning "Cleanup initiated..."
     
+    # Only needed for remote-only mode
     if [ -n "$SSH_PID" ] && kill -0 "$SSH_PID" 2>/dev/null; then
-        log_info "Terminating remote TCP server (PID: $SSH_PID)..."
-        # Send Ctrl+C to the SSH session
-        kill -INT "$SSH_PID" 2>/dev/null || true
-        sleep 2
-        # Force kill if still running
-        if kill -0 "$SSH_PID" 2>/dev/null; then
-            kill -KILL "$SSH_PID" 2>/dev/null || true
-        fi
-        log_success "Remote TCP server terminated"
+        log_info "Terminating SSH session..."
+        kill -TERM "$SSH_PID" 2>/dev/null || true
     fi
     
     # Try to stop recording if it was started
@@ -195,19 +234,6 @@ check_command() {
         log_error "Required command not found: $1"
         exit 1
     fi
-}
-
-wait_with_spinner() {
-    local duration=$1
-    local message=$2
-    local pid=$!
-    
-    echo -n "$message"
-    for ((i=0; i<duration; i++)); do
-        sleep 1
-        echo -n "."
-    done
-    echo " done"
 }
 
 test_ssh_connection() {
@@ -254,11 +280,12 @@ log_info "========================================"
 log_info "Host: $HOST"
 log_info "Recording: $RECORDING_NAME"
 log_info "Pulse pattern: $PULSE_PATTERN"
-log_info "Delay after pulses: ${DELAY_AFTER_PULSES}s"
+log_info "Recording duration: ${RECORDING_DURATION}s (auto-calculated)"
+log_info "  └─ Pattern time + ${SAFETY_MARGIN}s safety margin"
 log_info "========================================"
 
 # Step 1: Launch TCP Server on Remote Host
-log_info "Step 1: Launching TCP server on remote host..."
+log_info "Step 1: Launching TCP server with ${RECORDING_DURATION}s timeout..."
 log_info "Remote path: ${REMOTE_DATA_PATH}"
 
 # Create neural_data directory if it doesn't exist
@@ -267,28 +294,27 @@ ssh "${REMOTE_USER}@${HOST}" "mkdir -p ${REMOTE_BASE_PATH}/neural_data" || {
     exit 1
 }
 
-# Launch TCP server in background via SSH
-# Use nohup and redirect to ensure it stays alive and we can see output
-ssh "${REMOTE_USER}@${HOST}" "cd ${REMOTE_BASE_PATH} && python3 tcp_server.py -f neural_data/${RECORDING_FILE}" &
-SSH_PID=$!
-
-log_success "TCP server launched (PID: $SSH_PID)"
-log_info "Waiting for TCP server to initialize..."
-sleep 3
-
-# Verify SSH process is still running
-if ! kill -0 "$SSH_PID" 2>/dev/null; then
-    log_error "TCP server failed to start"
-    exit 1
-fi
-
+# Launch TCP server with timeout in background on remote host
+log_info "Starting remote TCP server with ${RECORDING_DURATION}s timeout..."
 if [ "$REMOTE_ONLY" = true ]; then
-    log_success "Remote server running. Press Ctrl+C to stop and save data."
+    # For remote-only, run interactively
+    ssh "${REMOTE_USER}@${HOST}" "cd ${REMOTE_BASE_PATH} && python3 tcp_server.py -t ${RECORDING_DURATION} -f neural_data/${RECORDING_FILE}" &
+    SSH_PID=$!
+    log_success "Remote server running. It will stop automatically after ${RECORDING_DURATION}s."
     log_info "SSH PID: $SSH_PID"
-    log_info "Waiting indefinitely..."
+    log_info "Waiting for timeout..."
     wait "$SSH_PID"
     exit 0
+else
+    # For automated mode, run in background
+    ssh "${REMOTE_USER}@${HOST}" "cd ${REMOTE_BASE_PATH} && nohup python3 tcp_server.py -t ${RECORDING_DURATION} -f neural_data/${RECORDING_FILE} > /tmp/tcp_server_${RECORDING_NAME}.log 2>&1 &"
 fi
+
+log_success "TCP server launched with ${RECORDING_DURATION}s timeout"
+log_info "Server will automatically stop and save data after timeout"
+log_info "Remote log: /tmp/tcp_server_${RECORDING_NAME}.log"
+log_info "Waiting for TCP server to initialize..."
+sleep 3
 
 # Step 2: Start Recording
 log_info "Step 2: Starting recording on neurocompressor..."
@@ -307,50 +333,51 @@ mosquitto_pub -h "$HOST" -t "$MQTT_GENERATOR_TOPIC" -m "$PULSE_PATTERN" -q 1 || 
     exit 1
 }
 log_success "Pulse pattern sent"
+sleep 1
 
-# Step 4: Wait for Pulses to Complete
-log_info "Step 4: Waiting for pulses to complete..."
-log_info "Delay: ${DELAY_AFTER_PULSES} seconds"
-sleep "$DELAY_AFTER_PULSES"
+# Step 4: Wait for TCP Server Timeout
+log_info "Step 4: Waiting for TCP server timeout (${RECORDING_DURATION}s)..."
+log_info "Server will save data automatically when timeout is reached"
 
-# Step 5: Stop Recording
-log_info "Step 5: Stopping recording..."
-mosquitto_pub -h "$HOST" -t "$MQTT_CONTROL_TOPIC" -m "record_off" -q 1 || {
-    log_error "Failed to stop recording"
-    exit 1
-}
-log_success "Recording stopped"
-sleep 2
+# Wait for the recording duration + 2 extra seconds for server to save
+WAIT_TIME=$((RECORDING_DURATION + 2))
+log_info "Waiting ${WAIT_TIME}s for recording and save..."
 
-# Step 6: Terminate TCP Server (saves data)
-log_info "Step 6: Terminating TCP server to save data..."
-if [ -n "$SSH_PID" ] && kill -0 "$SSH_PID" 2>/dev/null; then
-    kill -INT "$SSH_PID" 2>/dev/null || true
-    log_info "Waiting for TCP server to save data..."
-    sleep 3
-    
-    # Force kill if still running
-    if kill -0 "$SSH_PID" 2>/dev/null; then
-        log_warning "Force killing TCP server..."
-        kill -KILL "$SSH_PID" 2>/dev/null || true
+for ((i=1; i<=WAIT_TIME; i++)); do
+    if [ $((i % 5)) -eq 0 ]; then
+        log_info "  ${i}/${WAIT_TIME}s elapsed..."
     fi
-    SSH_PID=""  # Clear so cleanup doesn't try again
-fi
-log_success "TCP server terminated"
+    sleep 1
+done
 
-# Step 7: Verify Remote File Exists
-log_info "Step 7: Verifying remote data file..."
+log_success "Wait complete - TCP server should have saved data"
+
+# Step 5: Stop Recording (ensure it's off)
+log_info "Step 5: Ensuring recording is stopped..."
+mosquitto_pub -h "$HOST" -t "$MQTT_CONTROL_TOPIC" -m "record_off" -q 1 || {
+    log_warning "Failed to send record_off (may already be stopped)"
+}
+log_success "Recording stop command sent"
+sleep 1
+
+# Step 6: Verify Remote File Exists
+log_info "Step 6: Verifying remote data file..."
 if ssh "${REMOTE_USER}@${HOST}" "test -f ${REMOTE_DATA_PATH}"; then
-    FILE_SIZE=$(ssh "${REMOTE_USER}@${HOST}" "stat -f%z ${REMOTE_DATA_PATH} 2>/dev/null || stat -c%s ${REMOTE_DATA_PATH}")
+    FILE_SIZE=$(ssh "${REMOTE_USER}@${HOST}" "stat -c%s ${REMOTE_DATA_PATH} 2>/dev/null || stat -f%z ${REMOTE_DATA_PATH}")
     log_success "Remote file exists (${FILE_SIZE} bytes)"
 else
     log_error "Remote file not found: ${REMOTE_DATA_PATH}"
-    log_warning "Check TCP server logs for errors"
+    log_warning "Check TCP server logs: ssh ${REMOTE_USER}@${HOST} 'cat /tmp/tcp_server_${RECORDING_NAME}.log'"
+    
+    # Show last few lines of remote log if available
+    log_info "Fetching remote TCP server log..."
+    ssh "${REMOTE_USER}@${HOST}" "cat /tmp/tcp_server_${RECORDING_NAME}.log 2>/dev/null | tail -30" || log_warning "Could not fetch remote log"
+    
     exit 1
 fi
 
-# Step 8: Download Data
-log_info "Step 8: Downloading data from remote host..."
+# Step 7: Download Data
+log_info "Step 7: Downloading data from remote host..."
 log_info "Remote: ${REMOTE_USER}@${HOST}:${REMOTE_DATA_PATH}"
 log_info "Local: ${LOCAL_DATA_PATH}"
 
@@ -360,24 +387,26 @@ rsync -avz --progress "${REMOTE_USER}@${HOST}:${REMOTE_DATA_PATH}" "${LOCAL_DATA
 }
 
 if [ -f "$LOCAL_DATA_PATH" ]; then
-    LOCAL_SIZE=$(stat -f%z "$LOCAL_DATA_PATH" 2>/dev/null || stat -c%s "$LOCAL_DATA_PATH")
+    LOCAL_SIZE=$(stat -c%s "$LOCAL_DATA_PATH" 2>/dev/null || stat -f%z "$LOCAL_DATA_PATH")
     log_success "Data downloaded successfully (${LOCAL_SIZE} bytes)"
 else
     log_error "Downloaded file not found at ${LOCAL_DATA_PATH}"
     exit 1
 fi
 
-# Step 9: Verify JSON Format
-log_info "Step 9: Verifying JSON format..."
+# Step 8: Verify JSON Format
+log_info "Step 8: Verifying JSON format..."
 if python3 -m json.tool "$LOCAL_DATA_PATH" > /dev/null 2>&1; then
     log_success "JSON format valid"
 else
     log_error "Invalid JSON format in downloaded file"
+    log_info "First 500 chars of file:"
+    head -c 500 "$LOCAL_DATA_PATH"
     exit 1
 fi
 
-# Step 10: Generate Report
-log_info "Step 10: Generating analysis report..."
+# Step 9: Generate Report
+log_info "Step 9: Generating analysis report..."
 log_info "Input: ${LOCAL_DATA_PATH}"
 log_info "Output: ${LOCAL_REPORT_PATH}"
 
@@ -403,7 +432,7 @@ python3 "$REPORT_SCRIPT_PATH" --input "$LOCAL_DATA_PATH" --output "$LOCAL_REPORT
 }
 
 if [ -f "$LOCAL_REPORT_PATH" ]; then
-    REPORT_SIZE=$(stat -f%z "$LOCAL_REPORT_PATH" 2>/dev/null || stat -c%s "$LOCAL_REPORT_PATH")
+    REPORT_SIZE=$(stat -c%s "$LOCAL_REPORT_PATH" 2>/dev/null || stat -f%z "$LOCAL_REPORT_PATH")
     log_success "Report generated successfully (${REPORT_SIZE} bytes)"
 else
     log_error "Report file not found at ${LOCAL_REPORT_PATH}"
@@ -419,5 +448,6 @@ log_info "Data file: ${LOCAL_DATA_PATH}"
 log_info "Report: ${LOCAL_REPORT_PATH}"
 log_info "Recording name: ${RECORDING_NAME}"
 log_info "Host: ${HOST}"
+log_info "Recording duration: ${RECORDING_DURATION}s"
 log_success "========================================"
 echo ""
