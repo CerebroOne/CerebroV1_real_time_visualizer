@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  redis:
+  neural_redis:
     image: redis
     container_name: neural_redis
     restart: unless-stopped
@@ -41,14 +41,14 @@ services:
       - ./neural_data:/app/neural_data
       - ./real_time_visualizer_src:/app/real_time_visualizer_src
     environment:
-      - REDIS_HOST=redis
+      - REDIS_HOST=neural_redis
       - REDIS_PORT=6380
       - REDIS_DB=0
       - REDIS_QUEUE_NAME=neural_data_queue
       - LISTEN_HOST=0.0.0.0
       - LISTEN_PORT=5000
     depends_on:
-      redis:
+      neural_redis:
         condition: service_healthy
     networks:
       - neural_network
