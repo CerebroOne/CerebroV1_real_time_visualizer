@@ -1136,6 +1136,9 @@ def main():
     print("\nLoading dataset...")
     try:
         explorer.load_and_parse_data(args.input)
+        if explorer.data is None or explorer.data['valid_samples'] == 0:
+            print("Error: No valid data found in the dataset.")
+            return 1
     except FileNotFoundError as e:
         print(f"Error: Could not load file: {e}")
         return 1
